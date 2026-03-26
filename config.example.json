@@ -1,0 +1,12 @@
+{
+  "symbol": "BTCUSDT",
+  "mode": "short",
+  "upper_price": 70000,
+  "grids": 10,
+  "grid_ratio": 0.005,
+  "order_qty": 0.002,
+  "leverage": 3,
+  "poll_interval_sec": 1.0,
+  "status_interval_sec": 5.0,
+  "csv_path": "logs/grid_trades.csv"
+}
