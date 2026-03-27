@@ -1,0 +1,13 @@
+{
+  "symbol": "SIRENUSDT",
+  "mode": "short",
+  "upper_price": 2.5,
+  "grids": 15,
+  "grid_ratio": 0.05,
+  "order_qty": 5,
+  "leverage": 10,
+  "poll_interval_sec": 1.0,
+  "status_interval_sec": 5.0,
+  "csv_path": "logs/siren_short_5.csv",
+  "strategy_id": "siren_short_5"
+}

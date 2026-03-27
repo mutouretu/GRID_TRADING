@@ -1,13 +1,13 @@
 {
   "symbol": "BTCUSDT",
   "mode": "short",
-  "upper_price": 70000,
-  "grids": 20,
+  "upper_price": 70500,
+  "window_cells": 30,
   "grid_ratio": 0.0012,
   "order_qty": 0.004,
   "leverage": 10,
   "poll_interval_sec": 1.0,
   "status_interval_sec": 5.0,
-  "csv_path": "logs/btc_short_70000.csv"
+  "csv_path": "logs/btc_short_70500.csv"
 }
 

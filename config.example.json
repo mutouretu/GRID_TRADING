@@ -1,8 +1,8 @@
 {
   "symbol": "BTCUSDT",
   "mode": "short",
-  "upper_price": 70000,
-  "grids": 10,
+  "anchor_price": 70000,
+  "window_cells": 10,
   "grid_ratio": 0.005,
   "order_qty": 0.002,
   "leverage": 3,

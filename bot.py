@@ -25,7 +25,7 @@ def load_env_file(path: str) -> bool:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Binance Futures dual-trigger grid strategy")
+    parser = argparse.ArgumentParser(description="Binance Futures single-direction boundary-trigger grid strategy")
     parser.add_argument("--config", default="config.json", help="Path to JSON config")
     parser.add_argument("--base-url", default="https://fapi.binance.com", help="Binance Futures API base URL")
     parser.add_argument("--env-file", default=".env", help="Env file path, fallback to .env.example when missing")

@@ -173,3 +173,11 @@ class BinanceFuturesClient:
             {"symbol": symbol},
             signed=True,
         )
+
+    def cancel_order(self, symbol: str, order_id: int) -> Dict[str, Any]:
+        return self._request(
+            "DELETE",
+            "/fapi/v1/order",
+            {"symbol": symbol, "orderId": str(order_id)},
+            signed=True,
+        )

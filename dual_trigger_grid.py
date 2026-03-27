@@ -38,7 +38,7 @@ class CellState:
 @dataclass
 class StrategyConfig:
     symbol: str
-    grids: int
+    window_cells: int
     grid_ratio: Decimal
     order_qty: Decimal
     leverage: int
@@ -47,8 +47,7 @@ class StrategyConfig:
     status_interval_sec: float
     csv_path: str
     strategy_id: str
-    lower_price: Optional[Decimal] = None
-    upper_price: Optional[Decimal] = None
+    anchor_price: Decimal = Decimal("0")
 
 
 def log(msg: str) -> None:
@@ -148,9 +147,7 @@ def build_cells(cfg: StrategyConfig, tick_size: Decimal):
 
     cells = []
     if cfg.mode == "short":
-        if cfg.upper_price is None:
-            raise ValueError("mode=short requires upper_price")
-        upper = round_down(cfg.upper_price, tick_size)
+        upper = round_down(cfg.anchor_price, tick_size)
         lower = round_down(upper / growth, tick_size)
         if lower >= upper:
             lower = upper - tick_size
@@ -160,32 +157,14 @@ def build_cells(cfg: StrategyConfig, tick_size: Decimal):
         return cells
 
     if cfg.mode == "long":
-        if cfg.lower_price is None:
-            raise ValueError("mode=long requires lower_price")
-        lower = round_down(cfg.lower_price, tick_size)
+        lower = round_down(cfg.anchor_price, tick_size)
         upper = round_down(lower * growth, tick_size)
         if upper <= lower:
             upper = lower + tick_size
         cells.append(CellState(idx=0, lower=lower, upper=upper))
         return cells
 
-    if cfg.lower_price is None or cfg.upper_price is None:
-        raise ValueError("mode=both requires lower_price and upper_price")
-    if cfg.upper_price <= cfg.lower_price:
-        raise ValueError("upper_price must be larger than lower_price")
-
-    lower_anchor = cfg.lower_price
-    levels = [lower_anchor]
-    while levels[-1] < cfg.upper_price:
-        levels.append(levels[-1] * growth)
-
-    for i in range(len(levels) - 1):
-        lo = round_down(levels[i], tick_size)
-        up = round_down(levels[i + 1], tick_size)
-        if up <= lo:
-            up = lo + tick_size
-        cells.append(CellState(idx=i, lower=lo, upper=up))
-    return cells
+    raise ValueError("mode must be short or long")
 
 
 def parse_client_order_id(client_order_id: str) -> Optional[Tuple[str, str, str, int]]:
@@ -249,13 +228,6 @@ class DualTriggerGrid:
     def _client_id(self, side_tag: str, role_tag: str, idx: int) -> str:
         return f"dtg-{self.strategy_tag}-{side_tag}-{role_tag}-{idx}-{int(time.time())}"
 
-    def _active_count(self, direction: str) -> int:
-        if direction == "LONG":
-            return sum(1 for c in self.cells if c.long_entry is not None or c.long_exit is not None)
-        if direction == "SHORT":
-            return sum(1 for c in self.cells if c.short_entry is not None or c.short_exit is not None)
-        raise ValueError(f"unknown direction: {direction}")
-
     def _append_short_cell(self) -> None:
         if not self.cells:
             return
@@ -301,7 +273,6 @@ class DualTriggerGrid:
             elif self.cfg.mode == "long":
                 self._append_long_cell()
             else:
-                # mode=both keeps static range for now
                 break
             if len(self.cells) == 0:
                 break
@@ -376,6 +347,90 @@ class DualTriggerGrid:
                 self._append_long_cell()
                 if len(self.cells) == before:
                     break
+
+    def _cell_has_open_order(self, c: CellState) -> bool:
+        return (
+            c.long_entry is not None
+            or c.long_exit is not None
+            or c.short_entry is not None
+            or c.short_exit is not None
+        )
+
+    def _remove_cell_at(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self.cells):
+            return False
+        c = self.cells[idx]
+        # 不处理 exit 单，避免影响已成交后的平仓流程。
+        if c.long_exit is not None or c.short_exit is not None:
+            return False
+
+        if self.cfg.mode == "long" and c.long_entry is not None:
+            try:
+                self.client.cancel_order(self.cfg.symbol, c.long_entry)
+                self._write_event(
+                    event="ENTRY_CANCELED",
+                    cell_idx=c.idx,
+                    direction="LONG",
+                    order_role="ENTRY",
+                    order_id=c.long_entry,
+                    status="CANCELED",
+                    note="reclaim_far_cell",
+                )
+                log(f"LONG entry canceled for reclaim: cell={c.idx} orderId={c.long_entry}")
+                c.long_entry = None
+                c.long_armed = False
+            except Exception as exc:
+                log(f"LONG reclaim cancel failed: cell={c.idx} orderId={c.long_entry} err={exc}")
+                return False
+
+        if self.cfg.mode == "short" and c.short_entry is not None:
+            try:
+                self.client.cancel_order(self.cfg.symbol, c.short_entry)
+                self._write_event(
+                    event="ENTRY_CANCELED",
+                    cell_idx=c.idx,
+                    direction="SHORT",
+                    order_role="ENTRY",
+                    order_id=c.short_entry,
+                    status="CANCELED",
+                    note="reclaim_far_cell",
+                )
+                log(f"SHORT entry canceled for reclaim: cell={c.idx} orderId={c.short_entry}")
+                c.short_entry = None
+                c.short_armed = False
+            except Exception as exc:
+                log(f"SHORT reclaim cancel failed: cell={c.idx} orderId={c.short_entry} err={exc}")
+                return False
+
+        if self._cell_has_open_order(c):
+            return False
+        removed = self.cells.pop(idx)
+        for i, cell in enumerate(self.cells):
+            cell.idx = i
+        self._write_event(
+            event="CELL_REMOVED",
+            cell_idx=removed.idx,
+            note=f"lower={decimal_to_str(removed.lower)},upper={decimal_to_str(removed.upper)}",
+        )
+        log(f"cell removed: [{decimal_to_str(removed.lower)}, {decimal_to_str(removed.upper)}]")
+        return True
+
+    def _reclaim_far_cells(self) -> None:
+        while len(self.cells) > self.cfg.window_cells:
+            removed = False
+            # short/long 都是删除远端（较老锚点端）的 cell，这里就是列表前端。
+            for i in range(0, len(self.cells) - 1):
+                if self._remove_cell_at(i):
+                    removed = True
+                    break
+            if not removed:
+                break
+
+    def _maintain_cell_window(self, price: Decimal) -> None:
+        # 先补近端，保证当前价格附近有 cell。
+        self._expand_cells_for_price(price)
+        # 再回收远端，逐步回到目标窗口容量。
+        self._reclaim_far_cells()
 
     def _write_event(
         self,
@@ -516,10 +571,15 @@ class DualTriggerGrid:
 
         self._record_cells()
         self._recover_open_orders()
+        bootstrap_price = self.client.get_mark_price(self.cfg.symbol)
+        log(f"bootstrap mark={decimal_to_str(bootstrap_price)}")
+        self._expand_cells_for_price(bootstrap_price)
+        self._arm_cells(bootstrap_price)
+        self._maybe_place_entries()
 
         log(
             f"Strategy started: symbol={self.cfg.symbol}, mode={self.cfg.mode}, "
-            f"max_active={self.cfg.grids}, cells={len(self.cells)}, grid_ratio={decimal_to_str(self.cfg.grid_ratio)}, "
+            f"window_cells={self.cfg.window_cells}, cells={len(self.cells)}, grid_ratio={decimal_to_str(self.cfg.grid_ratio)}, "
             f"order_qty={decimal_to_str(self.order_qty)}, strategy={self.strategy_tag}, csv_path={self.cfg.csv_path}"
         )
 
@@ -537,7 +597,7 @@ class DualTriggerGrid:
         price = self.client.get_mark_price(self.cfg.symbol)
         log(f"mark={decimal_to_str(price)}")
 
-        self._expand_cells_for_price(price)
+        self._maintain_cell_window(price)
         self._arm_cells(price)
         self._sync_orders()
         self._maybe_place_entries()
@@ -576,7 +636,7 @@ class DualTriggerGrid:
     def _arm_cells(self, price: Decimal) -> None:
         for c in self.cells:
             if (
-                self.cfg.mode in ("both", "long")
+                self.cfg.mode == "long"
                 and c.long_entry is None
                 and c.long_exit is None
                 and not c.long_armed
@@ -587,7 +647,7 @@ class DualTriggerGrid:
                 self._write_event(event="ARM", cell_idx=c.idx, direction="LONG", price=price)
 
             if (
-                self.cfg.mode in ("both", "short")
+                self.cfg.mode == "short"
                 and c.short_entry is None
                 and c.short_exit is None
                 and not c.short_armed
@@ -598,13 +658,8 @@ class DualTriggerGrid:
                 self._write_event(event="ARM", cell_idx=c.idx, direction="SHORT", price=price)
 
     def _maybe_place_entries(self) -> None:
-        long_active = self._active_count("LONG")
-        short_active = self._active_count("SHORT")
-
         for c in self.cells:
-            if self.cfg.mode in ("both", "long") and c.long_armed and c.long_entry is None and c.long_exit is None:
-                if long_active >= self.cfg.grids:
-                    continue
+            if self.cfg.mode == "long" and c.long_armed and c.long_entry is None and c.long_exit is None:
                 qty = self.calc_qty(c.lower)
                 if qty > 0:
                     client_id = self._client_id("l", "e", c.idx)
@@ -632,7 +687,6 @@ class DualTriggerGrid:
                         qty=qty,
                         status="NEW",
                     )
-                    long_active += 1
                 else:
                     log(f"LONG entry skipped(minQty/minNotional): cell={c.idx} price={decimal_to_str(c.lower)}")
                     self._write_event(
@@ -645,9 +699,12 @@ class DualTriggerGrid:
                         note="minQty/minNotional",
                     )
 
-            if self.cfg.mode in ("both", "short") and c.short_armed and c.short_entry is None and c.short_exit is None:
-                if short_active >= self.cfg.grids:
-                    continue
+            if (
+                self.cfg.mode == "short"
+                and c.short_armed
+                and c.short_entry is None
+                and c.short_exit is None
+            ):
                 qty = self.calc_qty(c.upper)
                 if qty > 0:
                     client_id = self._client_id("s", "e", c.idx)
@@ -675,7 +732,6 @@ class DualTriggerGrid:
                         qty=qty,
                         status="NEW",
                     )
-                    short_active += 1
                 else:
                     log(f"SHORT entry skipped(minQty/minNotional): cell={c.idx} price={decimal_to_str(c.upper)}")
                     self._write_event(
@@ -813,6 +869,8 @@ class DualTriggerGrid:
                         price=c.lower,
                         client_id=exit_client_id,
                     )
+                    c.short_entry = None
+                    c.short_exit = exit_id
                     log(
                         f"SHORT entry filled: cell={c.idx} qty={decimal_to_str(qty)}; exit order={exit_id} @ {decimal_to_str(c.lower)}"
                     )
@@ -827,8 +885,6 @@ class DualTriggerGrid:
                         qty=qty,
                         status="NEW",
                     )
-                    c.short_entry = None
-                    c.short_exit = exit_id
                 elif status in ("CANCELED", "EXPIRED", "REJECTED"):
                     log(f"SHORT entry ended({status}): cell={c.idx} orderId={c.short_entry}")
                     self._write_event(
@@ -900,6 +956,14 @@ def load_config(path: str) -> StrategyConfig:
     if "order_qty" not in data:
         raise ValueError("config requires order_qty, e.g. 0.002 means 0.002 BTC per order")
 
+    mode = data.get("mode", "short")
+    anchor_raw = data.get("anchor_price")
+    if anchor_raw is None:
+        if mode == "short":
+            anchor_raw = data.get("upper_price")
+        elif mode == "long":
+            anchor_raw = data.get("lower_price")
+
     csv_path = str(data.get("csv_path", "grid_trades.csv"))
     strategy_id = str(data.get("strategy_id", "")).strip()
     if not strategy_id:
@@ -907,25 +971,24 @@ def load_config(path: str) -> StrategyConfig:
 
     return StrategyConfig(
         symbol=data["symbol"],
-        grids=int(data["grids"]),
+        window_cells=int(data.get("window_cells", data.get("grids", 20))),
         grid_ratio=Decimal(str(data["grid_ratio"])),
         order_qty=Decimal(str(data["order_qty"])),
         leverage=int(data.get("leverage", 3)),
-        mode=data.get("mode", "both"),
+        mode=mode,
         poll_interval_sec=float(data.get("poll_interval_sec", 1.0)),
         status_interval_sec=float(data.get("status_interval_sec", 5.0)),
         csv_path=csv_path,
         strategy_id=strategy_id,
-        lower_price=_opt_decimal(data.get("lower_price")),
-        upper_price=_opt_decimal(data.get("upper_price")),
+        anchor_price=Decimal(str(anchor_raw)) if anchor_raw is not None else Decimal("0"),
     )
 
 
 def validate_config(cfg: StrategyConfig) -> None:
-    if cfg.mode not in ("both", "long", "short"):
-        raise ValueError("mode must be one of: both, long, short")
-    if cfg.grids < 1:
-        raise ValueError("grids(max active cycles) must be >= 1")
+    if cfg.mode not in ("long", "short"):
+        raise ValueError("mode must be one of: long, short")
+    if cfg.window_cells < 1:
+        raise ValueError("window_cells must be >= 1")
     if cfg.grid_ratio <= 0:
         raise ValueError("grid_ratio must be > 0")
     if cfg.order_qty <= 0:
@@ -937,12 +1000,8 @@ def validate_config(cfg: StrategyConfig) -> None:
     if cfg.status_interval_sec < 0.5:
         raise ValueError("status_interval_sec should be >= 0.5")
 
-    if cfg.mode == "long" and cfg.lower_price is None:
-        raise ValueError("mode=long requires lower_price")
-    if cfg.mode == "short" and cfg.upper_price is None:
-        raise ValueError("mode=short requires upper_price")
-    if cfg.mode == "both" and (cfg.lower_price is None or cfg.upper_price is None):
-        raise ValueError("mode=both requires both lower_price and upper_price")
+    if cfg.anchor_price <= 0:
+        raise ValueError("anchor_price must be > 0")
 
     if cfg.poll_interval_sec < 0.2:
         raise ValueError("poll_interval_sec should be >= 0.2 to avoid aggressive polling")

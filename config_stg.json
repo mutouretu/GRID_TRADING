@@ -1,0 +1,13 @@
+{
+  "symbol": "STGUSDT",
+  "mode": "short",
+  "upper_price": 0.5,
+  "window_cells": 20,
+  "grid_ratio": 0.05,
+  "order_qty": 25,
+  "leverage": 10,
+  "poll_interval_sec": 1.0,
+  "status_interval_sec": 5.0,
+  "csv_path": "logs/stg_short_05.csv"
+}
+
