@@ -33,6 +33,7 @@ class CellState:
     long_exit: Optional[int] = None
     short_entry: Optional[int] = None
     short_exit: Optional[int] = None
+    short_open_qty: Decimal = Decimal("0")
 
 
 @dataclass
@@ -600,8 +601,54 @@ class DualTriggerGrid:
         self._maintain_cell_window(price)
         self._arm_cells(price)
         self._sync_orders()
+        self._repair_short_missing_exits()
         self._maybe_place_entries()
         self._print_status(price)
+
+    def _repair_short_missing_exits(self) -> None:
+        if self.cfg.mode != "short":
+            return
+        for c in self.cells:
+            if c.short_entry is not None:
+                continue
+            if c.short_exit is not None:
+                continue
+            qty = round_down(c.short_open_qty, self.filters.step_size)
+            if qty <= 0:
+                continue
+            client_id = self._client_id("s", "x", c.idx)
+            try:
+                exit_id = self.client.place_limit_order(
+                    symbol=self.cfg.symbol,
+                    side="BUY",
+                    position_side="SHORT",
+                    quantity=qty,
+                    price=c.lower,
+                    client_id=client_id,
+                )
+            except Exception as exc:
+                log(
+                    f"SHORT exit repair failed: cell={c.idx} qty={decimal_to_str(qty)} "
+                    f"price={decimal_to_str(c.lower)} err={exc}"
+                )
+                continue
+            c.short_exit = exit_id
+            log(
+                f"SHORT exit repaired: cell={c.idx} orderId={exit_id} "
+                f"qty={decimal_to_str(qty)} price={decimal_to_str(c.lower)}"
+            )
+            self._write_event(
+                event="EXIT_PLACED",
+                cell_idx=c.idx,
+                direction="SHORT",
+                order_role="EXIT",
+                order_id=exit_id,
+                client_order_id=client_id,
+                price=c.lower,
+                qty=qty,
+                status="NEW",
+                note="tick_exit_repair",
+            )
 
     def _print_status(self, mark_price: Decimal) -> None:
         now = time.time()
@@ -844,10 +891,19 @@ class DualTriggerGrid:
                     c.long_exit = None
 
             if c.short_entry is not None:
-                data = self.client.get_order(self.cfg.symbol, c.short_entry)
+                try:
+                    data = self.client.get_order(self.cfg.symbol, c.short_entry)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "-2011" in msg or "Unknown order sent" in msg:
+                        log(f"SHORT entry unknown on sync, clear ref: cell={c.idx} orderId={c.short_entry}")
+                        c.short_entry = None
+                        continue
+                    raise
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
+                    c.short_open_qty += qty
                     self._write_event(
                         event="ENTRY_FILLED",
                         cell_idx=c.idx,
@@ -901,10 +957,19 @@ class DualTriggerGrid:
                     c.short_entry = None
 
             if c.short_exit is not None:
-                data = self.client.get_order(self.cfg.symbol, c.short_exit)
+                try:
+                    data = self.client.get_order(self.cfg.symbol, c.short_exit)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "-2011" in msg or "Unknown order sent" in msg:
+                        log(f"SHORT exit missing on sync, clear ref: cell={c.idx} orderId={c.short_exit}")
+                        c.short_exit = None
+                        continue
+                    raise
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
+                    c.short_open_qty = max(Decimal("0"), c.short_open_qty - qty)
                     pnl = qty * (c.upper - c.lower)
                     self.total_trades += 1
                     self.total_profit += pnl
