@@ -1,0 +1,12 @@
+{
+  "symbol": "XAGUSDT",
+  "mode": "long",
+  "anchor_price": 60,
+  "window_cells": 30,
+  "grid_ratio": 0.01,
+  "order_qty": 0.2,
+  "leverage": 10,
+  "poll_interval_sec": 3.0,
+  "status_interval_sec": 15.0,
+  "csv_path": "logs/xag_long_60.csv"
+}

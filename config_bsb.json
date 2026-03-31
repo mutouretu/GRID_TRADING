@@ -6,8 +6,8 @@
   "grid_ratio": 0.05,
   "order_qty": 35,
   "leverage": 10,
-  "poll_interval_sec": 1.0,
-  "status_interval_sec": 5.0,
+  "poll_interval_sec": 5.0,
+  "status_interval_sec": 30.0,
   "csv_path": "logs/bsb_short_05.csv"
 }
 
