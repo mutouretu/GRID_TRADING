@@ -1055,10 +1055,7 @@ def _opt_decimal(v: object) -> Optional[Decimal]:
     return Decimal(str(v))
 
 
-def load_config(path: str) -> StrategyConfig:
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-
+def load_config_data(data: Dict[str, object], source_name: str = "") -> StrategyConfig:
     if "grid_ratio" not in data:
         raise ValueError("config requires grid_ratio, e.g. 0.005 means 0.5% per grid")
     if "order_usdt" not in data and "order_qty" not in data:
@@ -1082,7 +1079,10 @@ def load_config(path: str) -> StrategyConfig:
     csv_path = str(data.get("csv_path", "grid_trades.csv"))
     strategy_id = str(data.get("strategy_id", "")).strip()
     if not strategy_id:
-        strategy_id = os.path.splitext(os.path.basename(csv_path))[0]
+        if source_name:
+            strategy_id = source_name
+        else:
+            strategy_id = os.path.splitext(os.path.basename(csv_path))[0]
 
     return StrategyConfig(
         symbol=data["symbol"],
@@ -1097,6 +1097,12 @@ def load_config(path: str) -> StrategyConfig:
         strategy_id=strategy_id,
         anchor_price=anchor_price,
     )
+
+
+def load_config(path: str) -> StrategyConfig:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return load_config_data(data, source_name=os.path.splitext(os.path.basename(path))[0])
 
 
 def validate_config(cfg: StrategyConfig) -> None:

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.util
 import os
 import sys
 from typing import Optional
 
 from binance_client import BinanceFuturesClient
-from dual_trigger_grid import DualTriggerGrid, load_config, parse_filters, validate_config
+from dual_trigger_grid import DualTriggerGrid, load_config, load_config_data, parse_filters, validate_config
 
 
 def load_env_file(path: str) -> bool:
@@ -27,6 +28,8 @@ def load_env_file(path: str) -> bool:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Binance Futures single-direction boundary-trigger grid strategy")
     parser.add_argument("--config", default="config.json", help="Path to JSON config")
+    parser.add_argument("--profile", default="", help="Profile key in CONFIGS dict (from --config-py)")
+    parser.add_argument("--config-py", default="configs.py", help="Path to Python config file containing CONFIGS dict")
     parser.add_argument("--base-url", default="https://fapi.binance.com", help="Binance Futures API base URL")
     parser.add_argument("--env-file", default=".env", help="Env file path, fallback to .env.example when missing")
     args = parser.parse_args()
@@ -37,7 +40,26 @@ def main() -> int:
     elif args.env_file == ".env" and load_env_file(".env.example"):
         env_loaded = ".env.example"
 
-    cfg = load_config(args.config)
+    if args.profile:
+        if not os.path.exists(args.config_py):
+            print(f"Missing config-py file: {args.config_py}", file=sys.stderr)
+            return 1
+        spec = importlib.util.spec_from_file_location("runtime_configs", args.config_py)
+        if spec is None or spec.loader is None:
+            print(f"Failed to load config-py: {args.config_py}", file=sys.stderr)
+            return 1
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        configs = getattr(mod, "CONFIGS", None)
+        if not isinstance(configs, dict):
+            print(f"CONFIGS dict not found in {args.config_py}", file=sys.stderr)
+            return 1
+        if args.profile not in configs:
+            print(f"Profile not found: {args.profile}", file=sys.stderr)
+            return 1
+        cfg = load_config_data(configs[args.profile], source_name=args.profile)
+    else:
+        cfg = load_config(args.config)
     validate_config(cfg)
 
     api_key = os.getenv("BINANCE_API_KEY", "")
