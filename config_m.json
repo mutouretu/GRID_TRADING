@@ -1,0 +1,12 @@
+{
+  "symbol": "MUSDT",
+  "mode": "short",
+  "anchor_price": 2.5,
+  "window_cells": 10,
+  "grid_ratio": 0.02,
+  "order_qty": 5,
+  "leverage": 10,
+  "poll_interval_sec": 5.0,
+  "status_interval_sec": 35.0,
+  "csv_path": "logs/m_short_2d5.csv"
+}

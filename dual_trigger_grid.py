@@ -10,6 +10,7 @@ from typing import Dict, Optional, Tuple
 from binance_client import BinanceAPIError, BinanceFuturesClient, decimal_to_str
 
 getcontext().prec = 28
+LOG_PREFIX = ""
 
 
 @dataclass
@@ -33,6 +34,8 @@ class CellState:
     long_exit: Optional[int] = None
     short_entry: Optional[int] = None
     short_exit: Optional[int] = None
+    long_open_qty: Decimal = Decimal("0")
+    short_open_qty: Decimal = Decimal("0")
 
 
 @dataclass
@@ -40,7 +43,7 @@ class StrategyConfig:
     symbol: str
     window_cells: int
     grid_ratio: Decimal
-    order_qty: Decimal
+    order_usdt: Decimal
     leverage: int
     mode: str
     poll_interval_sec: float
@@ -52,7 +55,10 @@ class StrategyConfig:
 
 def log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] {msg}")
+    if LOG_PREFIX:
+        print(f"[{ts}] [{LOG_PREFIX}] {msg}")
+    else:
+        print(f"[{ts}] {msg}")
 
 
 def round_down(value: Decimal, step: Decimal) -> Decimal:
@@ -215,7 +221,6 @@ class DualTriggerGrid:
         self.cfg = cfg
         self.filters = filters
         self.cells = build_cells(cfg, filters.tick_size)
-        self.order_qty = round_down(cfg.order_qty, filters.step_size)
         self.growth = Decimal("1") + cfg.grid_ratio
         self.strategy_tag = make_strategy_tag(cfg.strategy_id)
 
@@ -540,7 +545,9 @@ class DualTriggerGrid:
             log(f"skipped foreign strategy open orders: {skipped_foreign}")
 
     def calc_qty(self, price: Decimal) -> Decimal:
-        qty = self.order_qty
+        if price <= 0:
+            return Decimal("0")
+        qty = round_down(self.cfg.order_usdt / price, self.filters.step_size)
         if qty <= 0:
             return Decimal("0")
         if qty < self.filters.min_qty:
@@ -550,6 +557,8 @@ class DualTriggerGrid:
         return qty
 
     def run_forever(self) -> None:
+        global LOG_PREFIX
+        LOG_PREFIX = f"{self.cfg.symbol}|{self.cfg.mode}|{self.strategy_tag}"
         try:
             self.client.set_hedge_mode(True)
             log("Hedge mode set: True")
@@ -580,7 +589,7 @@ class DualTriggerGrid:
         log(
             f"Strategy started: symbol={self.cfg.symbol}, mode={self.cfg.mode}, "
             f"window_cells={self.cfg.window_cells}, cells={len(self.cells)}, grid_ratio={decimal_to_str(self.cfg.grid_ratio)}, "
-            f"order_qty={decimal_to_str(self.order_qty)}, strategy={self.strategy_tag}, csv_path={self.cfg.csv_path}"
+            f"order_usdt={decimal_to_str(self.cfg.order_usdt)}, strategy={self.strategy_tag}, csv_path={self.cfg.csv_path}"
         )
 
         for c in self.cells:
@@ -600,8 +609,87 @@ class DualTriggerGrid:
         self._maintain_cell_window(price)
         self._arm_cells(price)
         self._sync_orders()
+        self._repair_short_missing_exits()
         self._maybe_place_entries()
         self._print_status(price)
+
+    def _repair_short_missing_exits(self) -> None:
+        for c in self.cells:
+            if self.cfg.mode == "short":
+                if c.short_entry is None and c.short_exit is None:
+                    qty = round_down(c.short_open_qty, self.filters.step_size)
+                    if qty > 0:
+                        client_id = self._client_id("s", "x", c.idx)
+                        try:
+                            exit_id = self.client.place_limit_order(
+                                symbol=self.cfg.symbol,
+                                side="BUY",
+                                position_side="SHORT",
+                                quantity=qty,
+                                price=c.lower,
+                                client_id=client_id,
+                            )
+                        except Exception as exc:
+                            log(
+                                f"SHORT exit repair failed: cell={c.idx} qty={decimal_to_str(qty)} "
+                                f"price={decimal_to_str(c.lower)} err={exc}"
+                            )
+                        else:
+                            c.short_exit = exit_id
+                            log(
+                                f"SHORT exit repaired: cell={c.idx} orderId={exit_id} "
+                                f"qty={decimal_to_str(qty)} price={decimal_to_str(c.lower)}"
+                            )
+                            self._write_event(
+                                event="EXIT_PLACED",
+                                cell_idx=c.idx,
+                                direction="SHORT",
+                                order_role="EXIT",
+                                order_id=exit_id,
+                                client_order_id=client_id,
+                                price=c.lower,
+                                qty=qty,
+                                status="NEW",
+                                note="tick_exit_repair",
+                            )
+
+            if self.cfg.mode == "long":
+                if c.long_entry is None and c.long_exit is None:
+                    qty = round_down(c.long_open_qty, self.filters.step_size)
+                    if qty > 0:
+                        client_id = self._client_id("l", "x", c.idx)
+                        try:
+                            exit_id = self.client.place_limit_order(
+                                symbol=self.cfg.symbol,
+                                side="SELL",
+                                position_side="LONG",
+                                quantity=qty,
+                                price=c.upper,
+                                client_id=client_id,
+                            )
+                        except Exception as exc:
+                            log(
+                                f"LONG exit repair failed: cell={c.idx} qty={decimal_to_str(qty)} "
+                                f"price={decimal_to_str(c.upper)} err={exc}"
+                            )
+                        else:
+                            c.long_exit = exit_id
+                            log(
+                                f"LONG exit repaired: cell={c.idx} orderId={exit_id} "
+                                f"qty={decimal_to_str(qty)} price={decimal_to_str(c.upper)}"
+                            )
+                            self._write_event(
+                                event="EXIT_PLACED",
+                                cell_idx=c.idx,
+                                direction="LONG",
+                                order_role="EXIT",
+                                order_id=exit_id,
+                                client_order_id=client_id,
+                                price=c.upper,
+                                qty=qty,
+                                status="NEW",
+                                note="tick_exit_repair",
+                            )
 
     def _print_status(self, mark_price: Decimal) -> None:
         now = time.time()
@@ -751,6 +839,7 @@ class DualTriggerGrid:
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
+                    c.long_open_qty += qty
                     self._write_event(
                         event="ENTRY_FILLED",
                         cell_idx=c.idx,
@@ -808,6 +897,7 @@ class DualTriggerGrid:
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
+                    c.long_open_qty = max(Decimal("0"), c.long_open_qty - qty)
                     pnl = qty * (c.upper - c.lower)
                     self.total_trades += 1
                     self.total_profit += pnl
@@ -844,10 +934,19 @@ class DualTriggerGrid:
                     c.long_exit = None
 
             if c.short_entry is not None:
-                data = self.client.get_order(self.cfg.symbol, c.short_entry)
+                try:
+                    data = self.client.get_order(self.cfg.symbol, c.short_entry)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "-2011" in msg or "Unknown order sent" in msg:
+                        log(f"SHORT entry unknown on sync, clear ref: cell={c.idx} orderId={c.short_entry}")
+                        c.short_entry = None
+                        continue
+                    raise
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
+                    c.short_open_qty += qty
                     self._write_event(
                         event="ENTRY_FILLED",
                         cell_idx=c.idx,
@@ -901,10 +1000,19 @@ class DualTriggerGrid:
                     c.short_entry = None
 
             if c.short_exit is not None:
-                data = self.client.get_order(self.cfg.symbol, c.short_exit)
+                try:
+                    data = self.client.get_order(self.cfg.symbol, c.short_exit)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "-2011" in msg or "Unknown order sent" in msg:
+                        log(f"SHORT exit missing on sync, clear ref: cell={c.idx} orderId={c.short_exit}")
+                        c.short_exit = None
+                        continue
+                    raise
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
+                    c.short_open_qty = max(Decimal("0"), c.short_open_qty - qty)
                     pnl = qty * (c.upper - c.lower)
                     self.total_trades += 1
                     self.total_profit += pnl
@@ -953,8 +1061,8 @@ def load_config(path: str) -> StrategyConfig:
 
     if "grid_ratio" not in data:
         raise ValueError("config requires grid_ratio, e.g. 0.005 means 0.5% per grid")
-    if "order_qty" not in data:
-        raise ValueError("config requires order_qty, e.g. 0.002 means 0.002 BTC per order")
+    if "order_usdt" not in data and "order_qty" not in data:
+        raise ValueError("config requires order_usdt (or legacy order_qty)")
 
     mode = data.get("mode", "short")
     anchor_raw = data.get("anchor_price")
@@ -963,6 +1071,13 @@ def load_config(path: str) -> StrategyConfig:
             anchor_raw = data.get("upper_price")
         elif mode == "long":
             anchor_raw = data.get("lower_price")
+    anchor_price = Decimal(str(anchor_raw)) if anchor_raw is not None else Decimal("0")
+
+    if "order_usdt" in data:
+        order_usdt = Decimal(str(data["order_usdt"]))
+    else:
+        # legacy compatibility: approximate by anchor price
+        order_usdt = Decimal(str(data["order_qty"])) * anchor_price
 
     csv_path = str(data.get("csv_path", "grid_trades.csv"))
     strategy_id = str(data.get("strategy_id", "")).strip()
@@ -973,14 +1088,14 @@ def load_config(path: str) -> StrategyConfig:
         symbol=data["symbol"],
         window_cells=int(data.get("window_cells", data.get("grids", 20))),
         grid_ratio=Decimal(str(data["grid_ratio"])),
-        order_qty=Decimal(str(data["order_qty"])),
+        order_usdt=order_usdt,
         leverage=int(data.get("leverage", 3)),
         mode=mode,
         poll_interval_sec=float(data.get("poll_interval_sec", 1.0)),
         status_interval_sec=float(data.get("status_interval_sec", 5.0)),
         csv_path=csv_path,
         strategy_id=strategy_id,
-        anchor_price=Decimal(str(anchor_raw)) if anchor_raw is not None else Decimal("0"),
+        anchor_price=anchor_price,
     )
 
 
@@ -991,8 +1106,8 @@ def validate_config(cfg: StrategyConfig) -> None:
         raise ValueError("window_cells must be >= 1")
     if cfg.grid_ratio <= 0:
         raise ValueError("grid_ratio must be > 0")
-    if cfg.order_qty <= 0:
-        raise ValueError("order_qty must be > 0")
+    if cfg.order_usdt <= 0:
+        raise ValueError("order_usdt must be > 0")
     if not cfg.csv_path.strip():
         raise ValueError("csv_path must not be empty")
     if not cfg.strategy_id.strip():
