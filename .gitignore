@@ -20,3 +20,5 @@ venv/
 
 # Runtime artifacts
 logs/
+
+configs.py
