@@ -154,21 +154,29 @@ def build_cells(cfg: StrategyConfig, tick_size: Decimal):
 
     cells = []
     if cfg.mode == "short":
+        target = cfg.window_cells if not cfg.move_grid else 1
         upper = round_down(cfg.anchor_price, tick_size)
-        lower = round_down(upper / growth, tick_size)
-        if lower >= upper:
-            lower = upper - tick_size
-        if lower <= 0:
-            raise ValueError("invalid short anchor price for initial cell")
-        cells.append(CellState(idx=0, lower=lower, upper=upper))
+        for i in range(target):
+            lower = round_down(upper / growth, tick_size)
+            if lower >= upper:
+                lower = upper - tick_size
+            if lower <= 0:
+                if i == 0:
+                    raise ValueError("invalid short anchor price for initial cell")
+                break
+            cells.append(CellState(idx=i, lower=lower, upper=upper))
+            upper = lower
         return cells
 
     if cfg.mode == "long":
+        target = cfg.window_cells if not cfg.move_grid else 1
         lower = round_down(cfg.anchor_price, tick_size)
-        upper = round_down(lower * growth, tick_size)
-        if upper <= lower:
-            upper = lower + tick_size
-        cells.append(CellState(idx=0, lower=lower, upper=upper))
+        for i in range(target):
+            upper = round_down(lower * growth, tick_size)
+            if upper <= lower:
+                upper = lower + tick_size
+            cells.append(CellState(idx=i, lower=lower, upper=upper))
+            lower = upper
         return cells
 
     raise ValueError("mode must be short or long")
