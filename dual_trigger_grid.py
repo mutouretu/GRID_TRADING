@@ -374,6 +374,9 @@ class DualTriggerGrid:
         if idx < 0 or idx >= len(self.cells):
             return False
         c = self.cells[idx]
+        # 有逻辑持仓时不能删除该 cell，否则会丢失平仓闭环。
+        if c.long_open_qty > 0 or c.short_open_qty > 0:
+            return False
         # 不处理 exit 单，避免影响已成交后的平仓流程。
         if c.long_exit is not None or c.short_exit is not None:
             return False
@@ -394,8 +397,14 @@ class DualTriggerGrid:
                 c.long_entry = None
                 c.long_armed = False
             except Exception as exc:
-                log(f"LONG reclaim cancel failed: cell={c.idx} orderId={c.long_entry} err={exc}")
-                return False
+                msg = str(exc)
+                if "-2011" in msg or "Unknown order sent" in msg:
+                    log(f"LONG reclaim cancel unknown, clear ref: cell={c.idx} orderId={c.long_entry}")
+                    c.long_entry = None
+                    c.long_armed = False
+                else:
+                    log(f"LONG reclaim cancel failed: cell={c.idx} orderId={c.long_entry} err={exc}")
+                    return False
 
         if self.cfg.mode == "short" and c.short_entry is not None:
             try:
@@ -413,8 +422,14 @@ class DualTriggerGrid:
                 c.short_entry = None
                 c.short_armed = False
             except Exception as exc:
-                log(f"SHORT reclaim cancel failed: cell={c.idx} orderId={c.short_entry} err={exc}")
-                return False
+                msg = str(exc)
+                if "-2011" in msg or "Unknown order sent" in msg:
+                    log(f"SHORT reclaim cancel unknown, clear ref: cell={c.idx} orderId={c.short_entry}")
+                    c.short_entry = None
+                    c.short_armed = False
+                else:
+                    log(f"SHORT reclaim cancel failed: cell={c.idx} orderId={c.short_entry} err={exc}")
+                    return False
 
         if self._cell_has_open_order(c):
             return False
@@ -555,6 +570,91 @@ class DualTriggerGrid:
         if skipped_foreign > 0:
             log(f"skipped foreign strategy open orders: {skipped_foreign}")
 
+    def _recover_open_qty_from_journal(self) -> None:
+        if not os.path.exists(self.journal.path):
+            return
+        for c in self.cells:
+            c.long_open_qty = Decimal("0")
+            c.short_open_qty = Decimal("0")
+
+        with open(self.journal.path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("symbol") != self.cfg.symbol:
+                    continue
+                direction = str(row.get("direction", "")).upper()
+                event = str(row.get("event", ""))
+                if event not in ("ENTRY_FILLED", "CYCLE_CLOSED"):
+                    continue
+                if self.cfg.mode == "short" and direction != "SHORT":
+                    continue
+                if self.cfg.mode == "long" and direction != "LONG":
+                    continue
+
+                qty_raw = row.get("qty", "")
+                try:
+                    qty = Decimal(str(qty_raw))
+                except Exception:
+                    continue
+                if qty <= 0:
+                    continue
+
+                idx_hint = -1
+                idx_raw = row.get("cell_idx", "")
+                if str(idx_raw).strip():
+                    try:
+                        idx_hint = int(str(idx_raw).strip())
+                    except Exception:
+                        idx_hint = -1
+
+                price = None
+                price_raw = row.get("price", "")
+                if str(price_raw).strip():
+                    try:
+                        price = Decimal(str(price_raw))
+                    except Exception:
+                        price = None
+
+                cell = None
+                if direction == "SHORT":
+                    if price is not None:
+                        if event == "ENTRY_FILLED":
+                            cell = self._find_or_make_cell_for_order("s", "e", price, idx_hint)
+                        else:
+                            cell = self._find_or_make_cell_for_order("s", "x", price, idx_hint)
+                    elif 0 <= idx_hint < len(self.cells):
+                        cell = self.cells[idx_hint]
+
+                    if cell is None:
+                        continue
+                    if event == "ENTRY_FILLED":
+                        cell.short_open_qty += qty
+                    else:
+                        cell.short_open_qty = max(Decimal("0"), cell.short_open_qty - qty)
+
+                elif direction == "LONG":
+                    if price is not None:
+                        if event == "ENTRY_FILLED":
+                            cell = self._find_or_make_cell_for_order("l", "e", price, idx_hint)
+                        else:
+                            cell = self._find_or_make_cell_for_order("l", "x", price, idx_hint)
+                    elif 0 <= idx_hint < len(self.cells):
+                        cell = self.cells[idx_hint]
+
+                    if cell is None:
+                        continue
+                    if event == "ENTRY_FILLED":
+                        cell.long_open_qty += qty
+                    else:
+                        cell.long_open_qty = max(Decimal("0"), cell.long_open_qty - qty)
+
+        short_total = sum((c.short_open_qty for c in self.cells), Decimal("0"))
+        long_total = sum((c.long_open_qty for c in self.cells), Decimal("0"))
+        log(
+            f"recovered open qty from csv: short={decimal_to_str(short_total)} "
+            f"long={decimal_to_str(long_total)}"
+        )
+
     def calc_qty(self, price: Decimal) -> Decimal:
         if price <= 0:
             return Decimal("0")
@@ -591,10 +691,11 @@ class DualTriggerGrid:
 
         self._record_cells()
         self._recover_open_orders()
+        self._recover_open_qty_from_journal()
         bootstrap_price = self.client.get_mark_price(self.cfg.symbol)
         log(f"bootstrap mark={decimal_to_str(bootstrap_price)}")
         if self.cfg.move_grid:
-            self._expand_cells_for_price(bootstrap_price)
+            self._maintain_cell_window(bootstrap_price)
         self._arm_cells(bootstrap_price)
         self._maybe_place_entries()
 
@@ -849,7 +950,15 @@ class DualTriggerGrid:
     def _sync_orders(self) -> None:
         for c in self.cells:
             if c.long_entry is not None:
-                data = self.client.get_order(self.cfg.symbol, c.long_entry)
+                try:
+                    data = self.client.get_order(self.cfg.symbol, c.long_entry)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "-2011" in msg or "Unknown order sent" in msg:
+                        log(f"LONG entry unknown on sync, clear ref: cell={c.idx} orderId={c.long_entry}")
+                        c.long_entry = None
+                        continue
+                    raise
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
@@ -907,7 +1016,15 @@ class DualTriggerGrid:
                     c.long_entry = None
 
             if c.long_exit is not None:
-                data = self.client.get_order(self.cfg.symbol, c.long_exit)
+                try:
+                    data = self.client.get_order(self.cfg.symbol, c.long_exit)
+                except Exception as exc:
+                    msg = str(exc)
+                    if "-2011" in msg or "Unknown order sent" in msg:
+                        log(f"LONG exit missing on sync, clear ref: cell={c.idx} orderId={c.long_exit}")
+                        c.long_exit = None
+                        continue
+                    raise
                 status = data["status"]
                 if status == "FILLED":
                     qty = Decimal(str(data["executedQty"]))
