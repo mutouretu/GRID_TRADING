@@ -521,12 +521,14 @@ class DualTriggerGrid:
                     cell.long_entry = order_id
                 else:
                     cell.long_exit = order_id
+                    cell.long_open_qty = max(cell.long_open_qty, qty)
                 direction = "LONG"
             else:
                 if role_tag == "e":
                     cell.short_entry = order_id
                 else:
                     cell.short_exit = order_id
+                    cell.short_open_qty = max(cell.short_open_qty, qty)
                 direction = "SHORT"
 
             recovered += 1
