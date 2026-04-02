@@ -42,6 +42,7 @@ class CellState:
 class StrategyConfig:
     symbol: str
     window_cells: int
+    move_grid: bool
     grid_ratio: Decimal
     order_usdt: Decimal
     leverage: int
@@ -582,13 +583,15 @@ class DualTriggerGrid:
         self._recover_open_orders()
         bootstrap_price = self.client.get_mark_price(self.cfg.symbol)
         log(f"bootstrap mark={decimal_to_str(bootstrap_price)}")
-        self._expand_cells_for_price(bootstrap_price)
+        if self.cfg.move_grid:
+            self._expand_cells_for_price(bootstrap_price)
         self._arm_cells(bootstrap_price)
         self._maybe_place_entries()
 
         log(
             f"Strategy started: symbol={self.cfg.symbol}, mode={self.cfg.mode}, "
-            f"window_cells={self.cfg.window_cells}, cells={len(self.cells)}, grid_ratio={decimal_to_str(self.cfg.grid_ratio)}, "
+            f"window_cells={self.cfg.window_cells}, move_grid={self.cfg.move_grid}, "
+            f"cells={len(self.cells)}, grid_ratio={decimal_to_str(self.cfg.grid_ratio)}, "
             f"order_usdt={decimal_to_str(self.cfg.order_usdt)}, strategy={self.strategy_tag}, csv_path={self.cfg.csv_path}"
         )
 
@@ -606,7 +609,8 @@ class DualTriggerGrid:
         price = self.client.get_mark_price(self.cfg.symbol)
         log(f"mark={decimal_to_str(price)}")
 
-        self._maintain_cell_window(price)
+        if self.cfg.move_grid:
+            self._maintain_cell_window(price)
         self._arm_cells(price)
         self._sync_orders()
         self._repair_short_missing_exits()
@@ -1075,6 +1079,7 @@ def load_config_data(data: Dict[str, object], source_name: str = "") -> Strategy
     else:
         # legacy compatibility: approximate by anchor price
         order_usdt = Decimal(str(data["order_qty"])) * anchor_price
+    move_grid = bool(data.get("move_grid", True))
 
     csv_path = str(data.get("csv_path", "grid_trades.csv"))
     strategy_id = str(data.get("strategy_id", "")).strip()
@@ -1087,6 +1092,7 @@ def load_config_data(data: Dict[str, object], source_name: str = "") -> Strategy
     return StrategyConfig(
         symbol=data["symbol"],
         window_cells=int(data.get("window_cells", data.get("grids", 20))),
+        move_grid=move_grid,
         grid_ratio=Decimal(str(data["grid_ratio"])),
         order_usdt=order_usdt,
         leverage=int(data.get("leverage", 3)),
