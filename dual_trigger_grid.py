@@ -154,7 +154,7 @@ def build_cells(cfg: StrategyConfig, tick_size: Decimal):
 
     cells = []
     if cfg.mode == "short":
-        target = cfg.window_cells if not cfg.move_grid else 1
+        target = cfg.window_cells
         upper = round_down(cfg.anchor_price, tick_size)
         for i in range(target):
             lower = round_down(upper / growth, tick_size)
@@ -169,7 +169,7 @@ def build_cells(cfg: StrategyConfig, tick_size: Decimal):
         return cells
 
     if cfg.mode == "long":
-        target = cfg.window_cells if not cfg.move_grid else 1
+        target = cfg.window_cells
         lower = round_down(cfg.anchor_price, tick_size)
         for i in range(target):
             upper = round_down(lower * growth, tick_size)
@@ -238,6 +238,13 @@ class DualTriggerGrid:
         self.total_profit = Decimal("0")
         self.start_ts = time.time()
         self.last_status_ts = 0.0
+        self._initialized = False
+        self.moved_cells_total = 0
+        self.move_cells_limit_reached = False
+
+    def _activate_log_prefix(self) -> None:
+        global LOG_PREFIX
+        LOG_PREFIX = f"{self.cfg.symbol}|{self.cfg.mode}|{self.strategy_tag}"
 
     def _client_id(self, side_tag: str, role_tag: str, idx: int) -> str:
         return f"dtg-{self.strategy_tag}-{side_tag}-{role_tag}-{idx}-{int(time.time())}"
@@ -351,16 +358,48 @@ class DualTriggerGrid:
             return
         if self.cfg.mode == "short":
             while price <= self.cells[-1].lower:
+                if self.cfg.move_grid and self.moved_cells_total >= self.cfg.window_cells:
+                    if not self.move_cells_limit_reached:
+                        self.move_cells_limit_reached = True
+                        self._write_event(
+                            event="MOVE_LIMIT_REACHED",
+                            price=price,
+                            status="LIMIT",
+                            note=f"moved_cells_total={self.moved_cells_total},max_move_cells={self.cfg.window_cells}",
+                        )
+                        log(
+                            f"move cells limit reached: moved_cells_total={self.moved_cells_total} "
+                            f"max_move_cells={self.cfg.window_cells} price={decimal_to_str(price)}"
+                        )
+                    break
                 before = len(self.cells)
                 self._append_short_cell()
                 if len(self.cells) == before:
                     break
+                self._reclaim_far_cells()
+                self.moved_cells_total += 1
         elif self.cfg.mode == "long":
             while price >= self.cells[-1].upper:
+                if self.cfg.move_grid and self.moved_cells_total >= self.cfg.window_cells:
+                    if not self.move_cells_limit_reached:
+                        self.move_cells_limit_reached = True
+                        self._write_event(
+                            event="MOVE_LIMIT_REACHED",
+                            price=price,
+                            status="LIMIT",
+                            note=f"moved_cells_total={self.moved_cells_total},max_move_cells={self.cfg.window_cells}",
+                        )
+                        log(
+                            f"move cells limit reached: moved_cells_total={self.moved_cells_total} "
+                            f"max_move_cells={self.cfg.window_cells} price={decimal_to_str(price)}"
+                        )
+                    break
                 before = len(self.cells)
                 self._append_long_cell()
                 if len(self.cells) == before:
                     break
+                self._reclaim_far_cells()
+                self.moved_cells_total += 1
 
     def _cell_has_open_order(self, c: CellState) -> bool:
         return (
@@ -458,7 +497,7 @@ class DualTriggerGrid:
     def _maintain_cell_window(self, price: Decimal) -> None:
         # 先补近端，保证当前价格附近有 cell。
         self._expand_cells_for_price(price)
-        # 再回收远端，逐步回到目标窗口容量。
+        # 再回收远端，回到目标窗口容量。
         self._reclaim_far_cells()
 
     def _write_event(
@@ -667,9 +706,8 @@ class DualTriggerGrid:
             return Decimal("0")
         return qty
 
-    def run_forever(self) -> None:
-        global LOG_PREFIX
-        LOG_PREFIX = f"{self.cfg.symbol}|{self.cfg.mode}|{self.strategy_tag}"
+    def initialize(self) -> None:
+        self._activate_log_prefix()
         try:
             self.client.set_hedge_mode(True)
             log("Hedge mode set: True")
@@ -696,6 +734,7 @@ class DualTriggerGrid:
         log(f"bootstrap mark={decimal_to_str(bootstrap_price)}")
         if self.cfg.move_grid:
             self._maintain_cell_window(bootstrap_price)
+        self._repair_short_missing_exits()
         self._arm_cells(bootstrap_price)
         self._maybe_place_entries()
 
@@ -709,8 +748,15 @@ class DualTriggerGrid:
         for c in self.cells:
             log(f"cell {c.idx}: [{decimal_to_str(c.lower)}, {decimal_to_str(c.upper)}]")
 
+        self._initialized = True
+
+    def run_forever(self) -> None:
+        if not self._initialized:
+            self.initialize()
+
         while True:
             try:
+                self._activate_log_prefix()
                 self.tick()
             except Exception as exc:
                 log(f"loop error: {exc}")
@@ -843,6 +889,7 @@ class DualTriggerGrid:
                 and c.long_entry is None
                 and c.long_exit is None
                 and not c.long_armed
+                and c.long_open_qty <= 0
                 and price >= c.lower
             ):
                 c.long_armed = True
@@ -854,6 +901,7 @@ class DualTriggerGrid:
                 and c.short_entry is None
                 and c.short_exit is None
                 and not c.short_armed
+                and c.short_open_qty <= 0
                 and price <= c.upper
             ):
                 c.short_armed = True
