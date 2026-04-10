@@ -56,17 +56,17 @@ class GridStubTests(unittest.TestCase):
     def _make_cfg(self, csv_path):
         return StrategyConfig(
             symbol="BTCUSDT",
-            mode="short",
-            upper_price=Decimal("70000"),
-            lower_price=None,
-            strategy_id="default",
-            grids=3,
+            window_cells=3,
+            move_grid=False,
             grid_ratio=Decimal("0.002"),
-            order_qty=Decimal("0.002"),
+            order_usdt=Decimal("140"),
             leverage=3,
+            mode="short",
             poll_interval_sec=1.0,
             status_interval_sec=1000.0,
             csv_path=csv_path,
+            strategy_id="default",
+            anchor_price=Decimal("70000"),
         )
 
     def _make_filters(self):
@@ -90,6 +90,48 @@ class GridStubTests(unittest.TestCase):
             self.assertEqual(sells[0]["price"], Decimal("70000"))
             self.assertEqual(sells[1]["price"], Decimal("69860.2"))
             self.assertEqual(sells[2]["price"], Decimal("69720.7"))
+
+    def test_move_grid_starts_with_full_window(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._make_cfg(os.path.join(d, "trades.csv"))
+            cfg.move_grid = True
+            client = FakeClient()
+            bot = DualTriggerGrid(client=client, cfg=cfg, filters=self._make_filters())
+
+            self.assertEqual(len(bot.cells), 3)
+            self.assertEqual(bot.cells[0].upper, Decimal("70000"))
+            self.assertEqual(bot.cells[-1].lower, Decimal("69581.5"))
+
+    def test_move_grid_shifts_by_one_cell(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._make_cfg(os.path.join(d, "trades.csv"))
+            cfg.move_grid = True
+            client = FakeClient()
+            bot = DualTriggerGrid(client=client, cfg=cfg, filters=self._make_filters())
+
+            bot._maintain_cell_window(Decimal("69581.5"))
+
+            self.assertEqual(len(bot.cells), 3)
+            self.assertEqual(bot.cells[0].upper, Decimal("69860.2"))
+            self.assertEqual(bot.cells[0].lower, Decimal("69720.7"))
+            self.assertEqual(bot.cells[-1].upper, Decimal("69581.5"))
+            self.assertEqual(bot.cells[-1].lower, Decimal("69442.6"))
+            self.assertEqual(bot.moved_cells_total, 1)
+
+    def test_move_grid_stops_after_window_cells_moves(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = self._make_cfg(os.path.join(d, "trades.csv"))
+            cfg.move_grid = True
+            client = FakeClient()
+            bot = DualTriggerGrid(client=client, cfg=cfg, filters=self._make_filters())
+
+            bot._maintain_cell_window(Decimal("69165.5"))
+
+            self.assertEqual(len(bot.cells), 3)
+            self.assertEqual(bot.moved_cells_total, 3)
+            self.assertTrue(bot.move_cells_limit_reached)
+            self.assertEqual(bot.cells[0].upper, Decimal("69581.5"))
+            self.assertEqual(bot.cells[-1].lower, Decimal("69165.5"))
 
     def test_recover_entry_prefers_price_mapping_not_legacy_idx(self):
         with tempfile.TemporaryDirectory() as d:
@@ -121,6 +163,7 @@ class GridStubTests(unittest.TestCase):
             buys = [o for o in client.placed if o["side"] == "BUY"]
             self.assertEqual(len(buys), 1)
             self.assertEqual(buys[0]["price"], Decimal("68614.7"))
+
 
 
 if __name__ == "__main__":
